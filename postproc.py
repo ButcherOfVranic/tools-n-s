@@ -1,20 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Combustor post-process özet aracı (yalnızca Python standart kütüphanesi gerekir).
+Combustor post-process aracı v3 (yalnızca Python standart kütüphanesi).
+Geliştiren: Muhammed Emin URAL
 
-Kullanım:
-  python postproc.py build              -> dashboard.html + results.csv üretir
-  python postproc.py inspect analiz-1   -> bir analizde neyi nasıl bulduğunu gösterir
-  python postproc.py diag analiz-1      -> dosyaların SADECE metin satırlarını yazar
-                                           (sayısal veri içermez, bana yapıştırabilirsin)
+  py postproc.py                      -> arayüzü açar (http://127.0.0.1:8765). Her şey arayüzden yapılır.
+  py postproc.py --root D:\\analizler  -> analizlerin bulunduğu klasörü ver (bir kez yeter, hatırlanır)
+  py postproc.py build                -> root içine tek dosyalık dashboard.html üretir (paylaşmak için)
+  py postproc.py diag [analiz-1]      -> dosya yapısını sayılar maskelenmiş olarak yazar (dışarıya yapıştırılabilir)
 
-Ayarlar config.json içindedir. Yeni analiz eklemek: klasörü root'a koy, `build`'i tekrar çalıştır.
+Dosya adlarına bağımlı değildir: analiz klasörlerindeki tüm metin dosyalarını içeriğine göre tanır
+(Fluent yüzey raporları, XY/circ-avg dosyaları, report-definition .out dosyaları, sütunlu tablolar).
+Hangi değerin ne olduğu (Pt giriş, swirler debisi, RTDF profili ...) arayüzde seçilir ve
+<root>/postproc_eslesme.json dosyasına kaydedilir.
 """
-import sys, os, re, json, csv, base64, math, argparse, time
+import sys, os, re, json, math, argparse, time, hashlib, webbrowser, mimetypes, threading
 from pathlib import Path
+from urllib.parse import unquote, urlparse, parse_qs
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = Path(__file__).resolve().parent
+VERSION = '3.0'
+AUTHOR = 'Muhammed Emin URAL'
+SCAN_VER = 3                       # ayrıştırıcı değişirse önbelleği geçersiz kılmak için artır
+LOCAL = HERE / 'postproc_local.json'   # makineye özel (root, port); repoda yok
+MAP_NAME = 'postproc_eslesme.json'
+DEFAULT_MAP = HERE / 'postproc_eslesme_varsayilan.json'   # son kaydedilen eşleme: yeni klasörlerde başlangıç
+CACHE_DIR = '.postproc_cache'
+MAX_TEXT = 30 * 1024 * 1024        # bundan büyük metin dosyaları atlanır
+MAX_PTS = 600                      # gömülen seri başına nokta
+IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.bmp', '.webp'}
+SKIP_EXT = {'.cas', '.dat', '.h5', '.cdat', '.msh', '.zip', '.gz', '.7z', '.rar', '.tar', '.pdf', '.exe', '.dll',
+            '.avi', '.mp4', '.mpg', '.mov', '.tif', '.tiff', '.pyc', '.xlsx', '.xls', '.docx', '.pptx', '.ip',
+            '.cxa', '.sdat', '.cff', '.bin', '.lic', '.jou_bak', '.trn'}
 
 # ----------------------------------------------------------------------------
 # Yardımcılar
@@ -30,53 +48,47 @@ def natural_key(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
 
 
-def glob_to_regex(pat):
-    """'**/' sıfır veya daha çok klasör, '*' klasör içi joker."""
-    pat = pat.replace('\\', '/').lower()
-    out, i = '', 0
-    while i < len(pat):
-        if pat.startswith('**/', i):
-            out += '(?:.*/)?'; i += 3
-        elif pat.startswith('**', i):
-            out += '.*'; i += 2
-        elif pat[i] == '*':
-            out += '[^/]*'; i += 1
-        elif pat[i] == '?':
-            out += '[^/]'; i += 1
-        else:
-            out += re.escape(pat[i]); i += 1
-    return re.compile('^' + out + '$')
+def norm(s):
+    return re.sub(r'\s+', ' ', str(s or '').strip().lower())
 
 
-def find_files(rels, patterns):
-    """İlk eşleşen desenin sonuçlarını döndürür (klasör derinliği az olan önce)."""
-    for pat in patterns:
-        rx = glob_to_regex(pat)
-        hits = [r for r in rels if rx.match(r.lower())]
-        if hits:
-            return sorted(hits, key=lambda r: (r.count('/'), len(r), r))
-    return []
-
-
-def read_text(path):
-    for enc in ('utf-8', 'latin-1'):
+def decode(raw):
+    for enc in ('utf-8-sig', 'cp1254', 'latin-1'):
         try:
-            return Path(path).read_text(encoding=enc)
+            return raw.decode(enc)
         except UnicodeDecodeError:
             continue
     return ''
 
 
-def clean(v):
-    if v is None:
-        return None
-    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-        return None
-    return v
+def read_json(p, default=None):
+    try:
+        return json.loads(decode(Path(p).read_bytes()))
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(p, obj):
+    p = Path(p)
+    tmp = p.with_suffix(p.suffix + '.tmp')
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding='utf-8')
+    os.replace(tmp, p)
+
+
+def finite(v):
+    return v is not None and not (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))
+
+
+def downsample(x, y, maxn=MAX_PTS):
+    if len(x) <= maxn:
+        return x, y
+    step = len(x) / maxn
+    idx = sorted({int(i * step) for i in range(maxn)} | {len(x) - 1})
+    return [x[i] for i in idx], [y[i] for i in idx]
 
 
 # ----------------------------------------------------------------------------
-# report.txt ayrıştırıcı  (Fluent yüzey raporu blokları, alt alta eklenmiş olabilir)
+# Ayrıştırıcılar (içerik tabanlı; dosya adına bakmaz)
 # ----------------------------------------------------------------------------
 def norm_kind(text):
     t = text.lower()
@@ -94,6 +106,7 @@ def norm_kind(text):
 
 
 def parse_report(text):
+    """Fluent yüzey raporu blokları (Surface Integrals / Report > ...). Alt alta eklenmiş birden çok blok olabilir."""
     lines = text.splitlines()
     n = len(lines)
     blocks, titles, i = [], [], 0
@@ -103,7 +116,7 @@ def parse_report(text):
             i += 1
             continue
         if DASH.match(ln):
-            rows, net, j = {}, None, i + 1
+            rows, j = {}, i + 1
             while j < n and lines[j].strip() and not DASH.match(lines[j]):
                 m = ROW.match(lines[j])
                 if not m:
@@ -114,13 +127,10 @@ def parse_report(text):
                 k = j + 1
                 while k < n and not lines[k].strip():
                     k += 1
-                if k < n:
-                    m = ROW.match(lines[k])
-                    if m:
-                        net = float(m.group(2))
-                        k += 1
+                if k < n and ROW.match(lines[k]):
+                    k += 1
                 j = k
-            if titles and (rows or net is not None):
+            if titles and rows:
                 last = titles[-1]
                 prev = titles[-2] if len(titles) > 1 else ''
                 if prev and any(w in prev.lower() for w in KIND_WORDS):
@@ -128,10 +138,9 @@ def parse_report(text):
                 else:
                     kind_text, var_text = last, last
                 um = UNIT.search(var_text)
-                unit = um.group(1).strip() if um else ''
-                var = UNIT.sub('', var_text).strip()
-                blocks.append({'kind': norm_kind(kind_text + ' ' + var_text), 'kind_text': kind_text.strip(),
-                               'var': var, 'unit': unit, 'rows': rows, 'net': net})
+                blocks.append({'kind': norm_kind(kind_text + ' ' + var_text), 'kt': kind_text.strip(),
+                               'var': UNIT.sub('', var_text).strip(), 'unit': um.group(1).strip() if um else '',
+                               'rows': rows})
             titles = []
             i = max(j, i + 1)
             continue
@@ -145,32 +154,34 @@ def parse_report(text):
     return blocks
 
 
-def find_val(blocks, kinds, var_sub, surf):
-    """Son (en yeni) eşleşen bloktan değer. Önce tam yüzey adı, sonra içeren ad."""
-    if isinstance(kinds, str):
-        kinds = [kinds]
-    for kind in kinds:
-        hit = None
-        for b in blocks:
-            if b['kind'] != kind:
-                continue
-            if var_sub and var_sub.lower() not in b['var'].lower():
-                continue
-            exact = [v for s, v in b['rows'].items() if s.lower() == surf.lower()]
-            part = [v for s, v in b['rows'].items() if surf.lower() in s.lower()]
-            if exact:
-                hit = exact[0]
-            elif part:
-                hit = part[0]
-        if hit is not None:
-            return hit, kind
-    return None, None
+def parse_out(text):
+    """Fluent report-definition dosyası (.out): tırnaklı başlık + iterasyon satırları. Son satır = son değer."""
+    header, rows = None, []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if header is None:
+            q = re.findall(r'"([^"]*)"', s)
+            if len(q) >= 2 and re.search(r'iteration|time ?step|flow-time|^time$', q[0], re.I):
+                header = q
+            continue
+        if s.startswith('('):
+            continue
+        toks = s.split()
+        if len(toks) != len(header):
+            continue
+        try:
+            rows.append([float(t) for t in toks])
+        except ValueError:
+            continue
+    if not header or not rows:
+        return None
+    return header, rows
 
 
-# ----------------------------------------------------------------------------
-# circ / radial avg ayrıştırıcı (Fluent XY dosyası veya sütunlu metin)
-# ----------------------------------------------------------------------------
 def parse_xy(text):
+    """Fluent XY dosyası ((xy/key/label ...)) veya başlıklı/başlıksız sütunlu tablo."""
     series, cur, header, labels = [], None, None, None
     for ln in text.splitlines():
         s = ln.strip()
@@ -185,6 +196,9 @@ def parse_xy(text):
         if m:
             labels = re.findall(r'"([^"]*)"', m.group(1))
             continue
+        m = re.match(r'\(\s*title\s+"([^"]*)"', s)
+        if m:
+            continue
         if s[0] in '()':
             continue
         toks = [t for t in re.split(r'[,\s;]+', s) if t]
@@ -192,21 +206,23 @@ def parse_xy(text):
             nums = [float(t) for t in toks]
         except ValueError:
             if not series and header is None:
-                header = [h.strip() for h in re.split(r'\s{2,}|\t|,', s) if h.strip()]
+                header = [h.strip().strip('"') for h in re.split(r'\s{2,}|\t|,|;', s) if h.strip()]
             continue
         if len(nums) < 2:
             continue
         if cur is None:
-            cur = {'name': '', 'x': [], 'y': [], 'cols': []}
+            cur = {'name': '', 'cols': []}
             series.append(cur)
-        if cur.get('cols') is not None and 'cols' in cur:
+        if 'cols' in cur:
             cur['cols'].append(nums)
         else:
             cur['x'].append(nums[0]); cur['y'].append(nums[1])
     out = []
     for s in series:
-        if 'cols' in s:  # sütunlu tablo: her y sütunu ayrı seri
+        if 'cols' in s:
             cols = s['cols']
+            if len(cols) < 3:
+                continue
             width = min(len(r) for r in cols)
             for c in range(1, width):
                 nm = ''
@@ -215,368 +231,365 @@ def parse_xy(text):
                 elif header and len(header) == width - 1:
                     nm = header[c - 1]
                 out.append({'name': nm or f'kolon{c}', 'x': [r[0] for r in cols], 'y': [r[c] for r in cols],
-                            'xlabel': (header[0] if header else '')})
-        else:
-            if s['x']:
-                s['xlabel'] = labels[0] if labels else ''
-                if labels and len(labels) > 1 and not s['name']:
-                    s['name'] = labels[1]
-                out.append(s)
+                            'xl': (header[0] if header and len(header) == width else ''), 'yl': nm})
+        elif len(s['x']) >= 2:
+            out.append({'name': s['name'], 'x': s['x'], 'y': s['y'],
+                        'xl': labels[0] if labels else '', 'yl': labels[1] if labels and len(labels) > 1 else ''})
     return out
 
 
-def pick_series(series, pick):
-    if not series:
+def series_entry(s, kind, sort_x):
+    pts = [(a, b) for a, b in zip(s['x'], s['y']) if finite(a) and finite(b)]
+    if len(pts) < 2:
         return None
-    if isinstance(pick, int):
-        return series[pick] if pick < len(series) else None
-    if isinstance(pick, str) and pick:
-        for s in series:
-            if pick.lower() in s['name'].lower():
-                return s
-        return None
-    return series[0]
+    if sort_x:
+        pts.sort()
+    x, y = [p[0] for p in pts], [p[1] for p in pts]
+    imax = max(range(len(y)), key=lambda i: y[i])
+    imin = min(range(len(y)), key=lambda i: y[i])
+    st = {'ymax': y[imax], 'xmax': x[imax], 'ymin': y[imin], 'xmin': x[imin], 'mean': sum(y) / len(y),
+          'last': y[-1], 'n': len(y)}
+    if sort_x and x[-1] > x[0]:  # x'e göre integral ortalaması (span ortalaması)
+        area = sum((x[i + 1] - x[i]) * (y[i + 1] + y[i]) / 2 for i in range(len(x) - 1))
+        st['imean'] = area / (x[-1] - x[0])
+    xs, ys = downsample(x, y)
+    return {'t': kind, 'nm': s['name'], 'xl': s.get('xl', ''), 'yl': s.get('yl', ''), 'x': xs, 'y': ys, 'st': st}
 
 
-def downsample(x, y, maxn=1500):
-    if len(x) <= maxn:
-        return x, y
-    step = len(x) / maxn
-    idx = sorted({int(i * step) for i in range(maxn)} | {len(x) - 1})
-    return [x[i] for i in idx], [y[i] for i in idx]
+def parse_file(text):
+    """Dönüş: (scalars, series, tür)"""
+    scal, ser = [], []
+    if '(xy/key/label' in text or re.search(r'^\s*\(labels\s', text, re.M):
+        for s in parse_xy(text):
+            e = series_entry(s, 'xy', True)
+            if e:
+                ser.append(e)
+        return scal, ser, 'xy'
+    out = parse_out(text)
+    if out:
+        header, rows = out
+        for c in range(1, len(header)):
+            scal.append({'kind': 'rdef', 'kt': 'Report definition', 'var': header[c], 'unit': '', 'surf': '',
+                         'v': rows[-1][c]})
+            e = series_entry({'name': header[c], 'x': [r[0] for r in rows], 'y': [r[c] for r in rows],
+                              'xl': header[0], 'yl': header[c]}, 'hist', False)
+            if e:
+                ser.append(e)
+        return scal, ser, 'out'
+    blocks = parse_report(text)
+    if blocks:
+        for b in blocks:
+            for surf, v in b['rows'].items():
+                if surf.lower() == 'net':
+                    continue
+                scal.append({'kind': b['kind'], 'kt': b['kt'], 'var': b['var'], 'unit': b['unit'], 'surf': surf,
+                             'v': v})
+        return scal, ser, 'report'
+    for s in parse_xy(text):
+        e = series_entry(s, 'xy', True)
+        if e:
+            ser.append(e)
+    return scal, ser, 'table' if ser else ''
 
 
 # ----------------------------------------------------------------------------
-# Analiz işleme
+# Tarama (önbellekli)
 # ----------------------------------------------------------------------------
-def load_config(path):
-    return json.loads(read_text(path))
-
-
-def list_analyses(cfg):
-    root = Path(cfg['root'])
-    rx = glob_to_regex(cfg.get('analysis_glob', '*'))
-    skip = {s.lower() for s in cfg.get('exclude', [])}
+def list_analyses(root):
+    root = Path(root)
     if not root.is_dir():
-        sys.exit(f"HATA: root klasörü bulunamadı: {root}\nconfig.json içindeki 'root' yolunu düzelt.")
-    dirs = [d for d in root.iterdir() if d.is_dir() and rx.match(d.name.lower()) and d.name.lower() not in skip]
+        return []
+    dirs = [d for d in root.iterdir() if d.is_dir() and not d.name.startswith(('.', '_'))]
     return sorted(dirs, key=lambda d: natural_key(d.name))
 
 
-def metric_defs(cfg):
-    defs = [
-        ('mdot_in', 'Giriş debisi', 'kg/s', 4, None, 'Debi'),
-        ('mdot_out', 'Çıkış debisi', 'kg/s', 4, None, 'Debi'),
-        ('mass_balance', 'Kütle dengesi (çıkış-giriş)/giriş', '%', 3, 'abs_low', 'Debi'),
-        ('Pt_in', 'Pt giriş', 'Pa', 1, None, 'Basınç'),
-        ('Pt_diff', 'Pt difüzör çıkışı', 'Pa', 1, None, 'Basınç'),
-        ('Pt_out', 'Pt çıkış', 'Pa', 1, None, 'Basınç'),
-        ('dPP_comb', 'dP/P toplam (giriş→çıkış)', '%', 3, 'low', 'Basınç'),
-        ('dPP_diff', 'dP/P difüzör (giriş→dif. çıkışı)', '%', 3, 'low', 'Basınç'),
-        ('dPP_liner', 'dP/P liner (dif. çıkışı→çıkış)', '%', 3, 'low', 'Basınç'),
-        ('Cp_diff', 'Difüzör Cp', '-', 4, 'high', 'Basınç'),
-        ('Tt_in', 'Tt giriş', 'K', 2, None, 'Sıcaklık'),
-        ('Tt_out', 'Tt çıkış (kütle ort.)', 'K', 2, None, 'Sıcaklık'),
-        ('dT', 'Sıcaklık artışı', 'K', 2, None, 'Sıcaklık'),
-        ('Tmax_exit', 'T maks (çıkış düzlemi)', 'K', 2, 'low', 'Sıcaklık'),
-        ('OTDF', 'OTDF', '-', 4, 'low', 'Sıcaklık'),
-        ('Tmax_circ', 'T maks (circ avg)', 'K', 2, 'low', 'Sıcaklık'),
-        ('span_Tmax_circ', 'Circ avg T maks. span konumu', '-', 4, None, 'Sıcaklık'),
-        ('RTDF', 'RTDF', '-', 4, 'low', 'Sıcaklık'),
-    ]
-    out = [{'key': k, 'label': l, 'unit': u, 'digits': d, 'better': b, 'group': g} for k, l, u, d, b, g in defs]
-    for i, fs in enumerate(cfg.get('flow_split', [])):
-        out.append({'key': f'split_{i}', 'label': fs['label'], 'unit': '%', 'digits': 2, 'better': None,
-                    'group': 'Debi dağılımı'})
-    out.append({'key': 'split_sum', 'label': 'Debi dağılımı toplamı', 'unit': '%', 'digits': 2, 'better': None,
-                'group': 'Debi dağılımı'})
+def file_list(adir):
+    out = []
+    for p in adir.rglob('*'):
+        try:
+            if p.is_file():
+                st = p.stat()
+                out.append((p.relative_to(adir).as_posix(), st.st_size, st.st_mtime))
+        except OSError:
+            continue
     return out
 
 
-def process_analysis(adir, cfg, out_dir, notes):
-    name = adir.name
-    warns = []
-    rels = [p.relative_to(adir).as_posix() for p in adir.rglob('*') if p.is_file()]
-    res = {'name': name, 'path': str(adir), 'metrics': {}, 'profiles': {}, 'images': [], 'warnings': warns,
-           'files': {}}
+def scan_analysis(adir, root, log=print):
+    files = file_list(adir)
+    sig = hashlib.md5(('%d|' % SCAN_VER + '\n'.join(f'{r}|{s}|{m:.0f}' for r, s, m in sorted(files)))
+                      .encode('utf-8', 'replace')).hexdigest()
+    cache = Path(root) / CACHE_DIR / (adir.name + '.json')
+    c = read_json(cache)
+    if c and c.get('sig') == sig:
+        return c['data']
+    log(f'  taranıyor: {adir.name} ({len(files)} dosya)')
+    sc, sr, imgs, skipped, errors, parsed = {}, {}, [], [], [], []
+    stem_drop = re.compile(re.escape(adir.name.lower()) + r'[-_ ]?')
+    for rel, size, mt in sorted(files, key=lambda f: (f[2], f[0])):   # eski -> yeni: aynı anahtarda yeni kazanır
+        ext = Path(rel).suffix.lower()
+        if ext in IMG_EXT:
+            imgs.append(rel)
+            continue
+        if ext in SKIP_EXT or size == 0:
+            continue
+        if size > MAX_TEXT:
+            skipped.append(f'{rel} (çok büyük: {size / 1e6:.0f} MB)')
+            continue
+        try:
+            raw = (adir / rel).read_bytes()
+            if b'\0' in raw[:8192]:
+                continue
+            scal, ser, kind = parse_file(decode(raw))
+        except Exception as e:  # tek bozuk dosya taramayı durdurmasın
+            errors.append(f'{rel}: {type(e).__name__}: {e}')
+            continue
+        if not kind:
+            continue
+        parsed.append({'f': rel, 'kind': kind, 'nsc': len(scal), 'nsr': len(ser)})
+        for s in scal:
+            s['f'] = rel
+            s['k'] = f"{s['kind']}|{norm(s['var'])}|{norm(s['surf'])}"
+            sc[s['k']] = s
+        base = stem_drop.sub('', Path(rel).stem.lower())
+        for s in ser:
+            s['f'] = rel
+            s['k'] = f"{s['t']}|{base}#{norm(s['nm'])}"
+            sr[s['k']] = s
+    mt = max((m for _, _, m in files), default=adir.stat().st_mtime)
+    data = {'name': adir.name, 'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(mt)),
+            'nfiles': len(files), 'sc': list(sc.values()), 'sr': list(sr.values()),
+            'img': sorted(imgs, key=natural_key), 'parsed': parsed, 'skipped': skipped, 'errors': errors}
     try:
-        res['mtime'] = time.strftime('%Y-%m-%d %H:%M', time.localtime(adir.stat().st_mtime))
+        cache.parent.mkdir(exist_ok=True)
+        write_json(cache, {'sig': sig, 'data': data})
     except OSError:
-        res['mtime'] = ''
-
-    # ---- report ----
-    rep = find_files(rels, cfg['files']['report'])
-    blocks = []
-    if not rep:
-        warns.append('report dosyası bulunamadı (config.json > files.report desenlerine bak)')
-    else:
-        if len(rep) > 1:
-            warns.append(f'birden çok report dosyası bulundu, ilki kullanıldı: {rep[0]}  (diğerleri: {len(rep) - 1})')
-        res['files']['report'] = rep[0]
-        blocks = parse_report(read_text(adir / rep[0]))
-        if not blocks:
-            warns.append('report dosyasında hiç blok ayrıştırılamadı (diag komutuyla biçime bak)')
-
-    S, V, K = cfg['surfaces'], cfg['vars'], cfg.get('kinds', {})
-
-    def g(var_key, surf_key, kinds=None):
-        kinds = kinds or [K.get(var_key, 'mwa'), 'mwa', 'awa']
-        v, used = find_val(blocks, kinds, V[var_key], S[surf_key])
-        if v is None:
-            warns.append(f"değer yok: {var_key} @ {surf_key} ('{V[var_key]}' / '{S[surf_key]}')")
-        return v
-
-    m = res['metrics']
-    m['Pt_in'], m['Pt_diff'], m['Pt_out'] = g('pt', 'inlet'), g('pt', 'diffuser_exit'), g('pt', 'outlet')
-    m['Tt_in'], m['Tt_out'] = g('tt', 'inlet'), g('tt', 'outlet')
-    ps_in, ps_diff = g('ps', 'inlet'), g('ps', 'diffuser_exit')
-    mi = g('mfr', 'inlet', ['mfr'])
-    mo = g('mfr', 'outlet', ['mfr'])
-    m['mdot_in'] = abs(mi) if mi is not None else None
-    m['mdot_out'] = abs(mo) if mo is not None else None
-
-    def pct_loss(a, b):
-        return (a - b) / a * 100.0 if a not in (None, 0) and b is not None else None
-
-    m['dPP_comb'] = pct_loss(m['Pt_in'], m['Pt_out'])
-    m['dPP_diff'] = pct_loss(m['Pt_in'], m['Pt_diff'])
-    m['dPP_liner'] = pct_loss(m['Pt_diff'], m['Pt_out'])
-    if m['mdot_in'] and m['mdot_out'] is not None:
-        m['mass_balance'] = (m['mdot_out'] - m['mdot_in']) / m['mdot_in'] * 100.0
-    if None not in (ps_in, ps_diff, m['Pt_in']) and (m['Pt_in'] - ps_in) != 0:
-        m['Cp_diff'] = (ps_diff - ps_in) / (m['Pt_in'] - ps_in)
-    dT = None
-    if m['Tt_in'] is not None and m['Tt_out'] is not None:
-        dT = m['Tt_out'] - m['Tt_in']
-        m['dT'] = dT
-        if dT <= 0:
-            warns.append('Tt çıkış <= Tt giriş: OTDF/RTDF hesaplanamaz')
-            dT = None
-
-    # ---- OTDF: çıkış düzlemi T maks ----
-    tmax, _ = find_val(blocks, ['max'], cfg.get('otdf_tmax_var', V['tt']), S['outlet'])
-    ov = notes.get(name, {}).get('overrides', {})
-    if 'Tmax_exit' in ov:
-        tmax = ov['Tmax_exit']
-    m['Tmax_exit'] = tmax
-    if tmax is None:
-        warns.append("OTDF için çıkış düzlemi T maks bulunamadı (report'ta 'Maximum' bloğu yok). "
-                     "notes.json > overrides > Tmax_exit ile elle girilebilir.")
-    if tmax is not None and dT:
-        m['OTDF'] = (tmax - m['Tt_out']) / dT
-
-    # ---- Profiller ----
-    prof_cfg = cfg.get('profiles', {})
-    for key, pc in prof_cfg.items():
-        files = find_files(rels, pc['patterns'])
-        if not files:
-            warns.append(f"profil dosyası yok: {key}")
-            continue
-        if len(files) > 1:
-            warns.append(f"profil '{key}': birden çok dosya, ilki kullanıldı: {files[0]}")
-        series = parse_xy(read_text(adir / files[0]))
-        s = pick_series(series, pc.get('series', 0))
-        if not s:
-            warns.append(f"profil '{key}' ayrıştırılamadı: {files[0]}")
-            continue
-        x, y = list(s['x']), list(s['y'])
-        x = [v * pc.get('x_scale', 1) for v in x]
-        y = [v * pc.get('y_scale', 1) for v in y]
-        entry = {'file': files[0]}
-        if y:
-            yi = max(range(len(y)), key=lambda i: y[i])
-            entry['max'] = {'x': x[yi], 'y': y[yi]}
-        x2, y2 = downsample(x, y)
-        entry['x'], entry['y'] = x2, y2
-        res['profiles'][key] = entry
-        res['files'][key] = files[0]
-
-    # ---- RTDF ----
-    rp = res['profiles'].get(cfg.get('rtdf_profile', ''))
-    if rp:
-        m['Tmax_circ'] = rp['max']['y']
-        m['span_Tmax_circ'] = rp['max']['x']
-        if dT and m['Tt_out'] is not None:
-            m['RTDF'] = (rp['max']['y'] - m['Tt_out']) / dT
-    elif cfg.get('rtdf_profile'):
-        warns.append('RTDF hesaplanamadı: rtdf_profile dosyası yok')
-
-    # ---- Debi dağılımı ----
-    split_sum, have = 0.0, False
-    for i, fs in enumerate(cfg.get('flow_split', [])):
-        v, _ = find_val(blocks, ['mfr'], '', fs['surface'])
-        if v is None or not m['mdot_in']:
-            warns.append(f"debi dağılımı: '{fs['label']}' ({fs['surface']}) bulunamadı")
-            m[f'split_{i}'] = None
-            continue
-        m[f'split_{i}'] = abs(v) / m['mdot_in'] * 100.0
-        if fs.get('in_sum', True):
-            split_sum += m[f'split_{i}']
-            have = True
-    m['split_sum'] = split_sum if have else None
-
-    # ---- Görseller ----
-    imgs = []
-    for pat in cfg.get('images', ['summary/**/*.png']):
-        rx = glob_to_regex(pat)
-        imgs += [r for r in rels if rx.match(r.lower()) and r not in imgs]
-    for r in sorted(imgs, key=natural_key):
-        res['images'].append(os.path.relpath(str(adir / r), out_dir).replace('\\', '/'))
-
-    res['metrics'] = {k: clean(v) for k, v in m.items()}
-    return res
+        pass
+    return data
 
 
-def data_uri(path):
-    p = Path(path)
-    if not p.is_absolute():
-        p = Path(cfg_root_for_assets) / p
-    if not p.is_file():
-        return None
-    mime = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.svg': 'image/svg+xml',
-            '.gif': 'image/gif'}.get(p.suffix.lower(), 'application/octet-stream')
-    return f'data:{mime};base64,' + base64.b64encode(p.read_bytes()).decode()
-
-
-cfg_root_for_assets = HERE
-
-
-def build(cfg, cfg_path):
-    global cfg_root_for_assets
-    cfg_root_for_assets = Path(cfg_path).resolve().parent
-    out_dir = Path(cfg.get('out_dir') or cfg['root'])
-    out_dir.mkdir(parents=True, exist_ok=True)
-    notes_path = out_dir / 'notes.json'
-    notes = json.loads(read_text(notes_path)) if notes_path.is_file() else {}
+def collect(root, mode, log=print):
+    root = Path(root) if root else None
+    ok = bool(root and root.is_dir())
     analyses = []
-    dirs = list_analyses(cfg)
-    if not dirs:
-        sys.exit("HATA: root altında analiz klasörü bulunamadı (analysis_glob desenini kontrol et).")
-    for d in dirs:
-        print(f'  işleniyor: {d.name}')
-        a = process_analysis(d, cfg, out_dir, notes)
-        a['note'] = notes.get(d.name, {}).get('note', '')
-        a['tags'] = notes.get(d.name, {}).get('tags', '')
-        analyses.append(a)
+    if ok:
+        for d in list_analyses(root):
+            try:
+                analyses.append(scan_analysis(d, root, log))
+            except Exception as e:
+                analyses.append({'name': d.name, 'mtime': '', 'nfiles': 0, 'sc': [], 'sr': [], 'img': [],
+                                 'parsed': [], 'skipped': [], 'errors': [f'TARANAMADI: {type(e).__name__}: {e}']})
+    return {'version': VERSION, 'author': AUTHOR, 'mode': mode, 'generated': time.strftime('%Y-%m-%d %H:%M'),
+            'root': str(root or ''), 'root_ok': ok, 'base': 'files/' if mode == 'serve' else '',
+            'analyses': analyses, 'mapping': (read_json(root / MAP_NAME) if ok else None),
+            'default_mapping': read_json(DEFAULT_MAP)}
 
-    defs = metric_defs(cfg)
-    ref = cfg.get('reference') or analyses[0]['name']
-    if ref not in [a['name'] for a in analyses]:
-        ref = analyses[0]['name']
-    data = {
-        'generated': time.strftime('%Y-%m-%d %H:%M'),
-        'reference': ref,
-        'analyses': analyses,
-        'metrics': defs,
-        'profiles': [{'key': k, 'label': v.get('label', k), 'xlabel': v.get('xlabel', 'Span'),
-                      'ylabel': v.get('ylabel', ''), 'swap': v.get('span_vertical', True),
-                      'group': v.get('group', '')} for k, v in cfg.get('profiles', {}).items()],
-        'split_def': [{'key': f'split_{i}', 'label': fs['label'], 'x': fs.get('x', 0.1 + 0.15 * i),
-                       'y': fs.get('y', 0.1)} for i, fs in enumerate(cfg.get('flow_split', []))],
-        'section_image': data_uri(cfg['section_image']) if cfg.get('section_image') else None,
-    }
-    # CSV
-    with open(out_dir / 'results.csv', 'w', newline='', encoding='utf-8-sig') as f:
-        w = csv.writer(f, delimiter=';')
-        w.writerow(['analiz'] + [f"{d['label']} [{d['unit']}]" for d in defs])
-        for a in analyses:
-            w.writerow([a['name']] + [('' if a['metrics'].get(d['key']) is None else a['metrics'][d['key']])
-                                      for d in defs])
-    tpl = read_text(HERE / 'dashboard_template.html')
-    html = tpl.replace('__DATA__', json.dumps(data, ensure_ascii=False, allow_nan=False).replace('</', '<\\/'))
-    out = out_dir / 'dashboard.html'
-    out.write_text(html, encoding='utf-8')
-    nw = sum(len(a['warnings']) for a in analyses)
-    print(f'\nTamam: {len(analyses)} analiz, {nw} uyarı.\n  {out}\n  {out_dir / "results.csv"}')
+
+def render_html(data):
+    tpl = HERE / 'dashboard_template.html'
+    if not tpl.is_file():
+        sys.exit(f'HATA: {tpl.name} bulunamadı. postproc.py ile aynı klasöre koy.')
+    js = json.dumps(data, ensure_ascii=False, allow_nan=False).replace('</', '<\\/')
+    return decode(tpl.read_bytes()).replace('__DATA__', js)
+
+
+def build_static(root, log=print):
+    data = collect(root, 'static', log)
+    if not data['root_ok']:
+        raise RuntimeError(f'root klasörü yok: {root}')
+    out = Path(root) / 'dashboard.html'
+    out.write_text(render_html(data), encoding='utf-8')
+    return out, len(data['analyses'])
 
 
 # ----------------------------------------------------------------------------
-# inspect / diag
+# Yerel sunucu
 # ----------------------------------------------------------------------------
-def resolve_analysis(cfg, name):
-    p = Path(name)
-    if p.is_dir():
-        return p
-    p = Path(cfg['root']) / name
-    if p.is_dir():
-        return p
-    sys.exit(f'Analiz klasörü bulunamadı: {name}')
+class State:
+    root = ''
+    lock = threading.Lock()
 
 
-def cmd_inspect(cfg, name):
-    adir = resolve_analysis(cfg, name)
-    rels = [p.relative_to(adir).as_posix() for p in adir.rglob('*') if p.is_file()]
-    print(f'== {adir}  ({len(rels)} dosya)')
-    rep = find_files(rels, cfg['files']['report'])
-    print('\n[report]', rep or 'BULUNAMADI')
-    if rep:
-        for b in parse_report(read_text(adir / rep[0])):
-            surf = ', '.join(f'{s}={v:.5g}' for s, v in b['rows'].items())
-            print(f"  {b['kind']:>6} | {b['var']} ({b['unit']}) | {surf} | net={b['net']}")
-    for key, pc in cfg.get('profiles', {}).items():
-        files = find_files(rels, pc['patterns'])
-        print(f'\n[profil: {key}]', files[:3] or 'BULUNAMADI')
-        if files:
-            ser = parse_xy(read_text(adir / files[0]))
-            print(f'  {len(ser)} seri', [(s['name'], len(s['x'])) for s in ser][:6])
-    print('\n[tüm .txt/.rxt/.out/.csv dosyaları]')
-    for r in sorted(rels, key=natural_key):
-        if r.lower().endswith(('.txt', '.rxt', '.out', '.csv', '.xy', '.dat')):
-            print('  ', r)
+def save_local(**kw):
+    d = read_json(LOCAL, {}) or {}
+    d.update(kw)
+    try:
+        write_json(LOCAL, d)
+    except OSError:
+        pass
 
 
-def cmd_diag(cfg, name):
-    """Sadece sayısal olmayan satırları yazar: dosya yapısı paylaşılabilsin, veri sızmasın."""
-    adir = resolve_analysis(cfg, name)
-    rels = [p.relative_to(adir).as_posix() for p in adir.rglob('*') if p.is_file()]
-    print('### Klasör yapısı (ilk 150 dosya)')
-    for r in sorted(rels, key=natural_key)[:150]:
-        print('  ', r)
-    cand = []
-    rep = find_files(rels, cfg['files']['report'])
-    cand += rep[:1]
-    for pc in cfg.get('profiles', {}).values():
-        cand += find_files(rels, pc['patterns'])[:1]
-    seen = set()
-    for r in cand:
-        if r in seen:
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, code, body, ctype='text/plain; charset=utf-8'):
+        if isinstance(body, str):
+            body = body.encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def jsend(self, obj, code=200):
+        self.send(code, json.dumps(obj, ensure_ascii=False), 'application/json; charset=utf-8')
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        path = unquote(u.path)
+        try:
+            if path in ('/', '/index.html'):
+                with State.lock:
+                    data = collect(State.root, 'serve')
+                return self.send(200, render_html(data), 'text/html; charset=utf-8')
+            if path.startswith('/files/'):
+                root = Path(State.root).resolve()
+                p = (root / path[len('/files/'):]).resolve()
+                if root not in p.parents or not p.is_file():
+                    return self.send(404, 'yok')
+                ctype = mimetypes.guess_type(p.name)[0] or 'application/octet-stream'
+                return self.send(200, p.read_bytes(), ctype)
+            if path == '/api/ping':
+                return self.jsend({'ok': True})
+            return self.send(404, 'yok')
+        except (ConnectionError, BrokenPipeError):
+            pass
+        except Exception as e:
+            self.send(500, f'{type(e).__name__}: {e}')
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+            body = json.loads(self.rfile.read(n).decode('utf-8') or '{}')
+            if path == '/api/mapping':
+                if not Path(State.root).is_dir():
+                    return self.jsend({'ok': False, 'err': 'root yok'}, 400)
+                write_json(Path(State.root) / MAP_NAME, body)
+                try:
+                    write_json(DEFAULT_MAP, body)
+                except OSError:
+                    pass
+                return self.jsend({'ok': True})
+            if path == '/api/root':
+                r = str(body.get('root', '')).strip().strip('"')
+                if not Path(r).is_dir():
+                    return self.jsend({'ok': False, 'err': f'klasör bulunamadı: {r}'}, 400)
+                State.root = str(Path(r))
+                save_local(root=State.root)
+                return self.jsend({'ok': True})
+            if path == '/api/build':
+                with State.lock:
+                    out, n = build_static(State.root, log=lambda *a: None)
+                return self.jsend({'ok': True, 'path': str(out), 'n': n})
+            if path == '/api/open':  # klasörü Windows Gezgini'nde aç
+                p = (Path(State.root) / body.get('rel', '')).resolve()
+                if Path(State.root).resolve() in [p, *p.parents] and p.exists() and hasattr(os, 'startfile'):
+                    os.startfile(str(p if p.is_dir() else p.parent))
+                return self.jsend({'ok': True})
+            return self.send(404, 'yok')
+        except Exception as e:
+            self.jsend({'ok': False, 'err': f'{type(e).__name__}: {e}'}, 500)
+
+
+def serve(root, port, open_browser=True):
+    State.root = root or ''
+    srv = None
+    for p in range(port, port + 20):
+        try:
+            srv = ThreadingHTTPServer(('127.0.0.1', p), Handler)
+            break
+        except OSError:
             continue
-        seen.add(r)
-        print(f'\n### {r}  (sayısal satırlar atlandı)')
-        nrows, shown = 0, 0
-        for ln in read_text(adir / r).splitlines():
+    if not srv:
+        sys.exit('HATA: boş port bulunamadı.')
+    url = f'http://127.0.0.1:{srv.server_address[1]}/'
+    print(f'Combustor post-process v{VERSION}  ·  geliştiren: {AUTHOR}')
+    print(f'  analiz klasörü : {State.root or "(seçilmedi - arayüzden gir)"}')
+    print(f'  arayüz         : {url}')
+    print('  Kapatmak için bu pencerede Ctrl+C.')
+    if State.root and Path(State.root).is_dir():
+        collect(State.root, 'serve')   # ilk taramayı burada yap, ilerleme konsolda görünsün
+    if open_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print('\nkapatıldı.')
+
+
+# ----------------------------------------------------------------------------
+# diag
+# ----------------------------------------------------------------------------
+def cmd_diag(root, name):
+    dirs = list_analyses(root)
+    if not dirs:
+        sys.exit(f'Analiz klasörü yok: {root}')
+    adir = next((d for d in dirs if d.name == name), None) if name else dirs[0]
+    if adir is None:
+        sys.exit(f'Analiz klasörü bulunamadı: {name}')
+    data = scan_analysis(adir, root, log=lambda *a: None)
+    print(f'### postproc {VERSION} ({AUTHOR}) · {adir.name} · {data["nfiles"]} dosya, {len(data["img"])} görsel')
+    print('\n### Tanınan dosyalar (tür, skaler sayısı, seri sayısı)')
+    for p in data['parsed']:
+        print(f"   {p['kind']:<7} {p['nsc']:>4} {p['nsr']:>4}  {p['f']}")
+    print('\n### Bulunan skalerler (değerler gizli)')
+    for s in data['sc'][:300]:
+        print(f"   {s['kind']:<5} | {s['var']} [{s['unit']}] | {s['surf']}")
+    print('\n### Bulunan seriler')
+    for s in data['sr'][:150]:
+        print(f"   {s['t']:<5} | {s['f']} | {s['nm']} | {s['xl']} / {s['yl']} | {s['st']['n']} nokta")
+    for s in data['skipped'] + data['errors']:
+        print('   !', s)
+    shown = 0
+    for p in data['parsed']:
+        if shown >= 6:
+            break
+        shown += 1
+        print(f"\n### {p['f']}  (sayılar maskeli, ilk 40 metin satırı)")
+        k = 0
+        for ln in decode((adir / p['f']).read_bytes()).splitlines():
             toks = [t for t in re.split(r'[,\s;]+', ln.strip()) if t]
             try:
                 [float(t) for t in toks]
-                is_num = bool(toks)
-            except ValueError:
-                is_num = False
-            if is_num:
-                nrows += 1
                 continue
-            if ln.strip() and shown < 60:
-                # sayıları maskele: yüzey adı/başlık yapısı görünür, değerler görünmez
-                print(re.sub(r'(?<![A-Za-z_-])' + NUM + r'(?![A-Za-z_])', '#', ln.rstrip())); shown += 1
-        print(f'  [... {nrows} sayısal satır atlandı]')
+            except ValueError:
+                pass
+            if ln.strip() and k < 40:
+                print(re.sub(r'(?<![A-Za-z_-])' + NUM + r'(?![A-Za-z_])', '#', ln.rstrip()))
+                k += 1
 
 
+# ----------------------------------------------------------------------------
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
-    ap = argparse.ArgumentParser(description='Combustor post-process özet aracı')
-    ap.add_argument('cmd', choices=['build', 'inspect', 'diag'])
-    ap.add_argument('analysis', nargs='?')
-    ap.add_argument('--config', default=str(HERE / 'config.json'))
+    ap = argparse.ArgumentParser(description=f'Combustor post-process aracı v{VERSION}')
+    ap.add_argument('cmd', nargs='?', default='serve', choices=['serve', 'build', 'diag'])
+    ap.add_argument('analysis', nargs='?', help='diag için analiz klasörü adı')
+    ap.add_argument('--root', help='analiz klasörlerinin bulunduğu klasör (hatırlanır)')
+    ap.add_argument('--port', type=int, default=None)
+    ap.add_argument('--no-open', action='store_true', help='tarayıcıyı otomatik açma')
     a = ap.parse_args()
-    cfg = load_config(a.config)
-    if a.cmd == 'build':
-        build(cfg, a.config)
+    local = read_json(LOCAL, {}) or {}
+    root = a.root or local.get('root') or (read_json(HERE / 'config.json', {}) or {}).get('root', '')
+    if a.root:
+        save_local(root=str(Path(a.root)))
+    if a.cmd == 'serve':
+        serve(root, a.port or local.get('port', 8765), not a.no_open)
+    elif a.cmd == 'build':
+        if not root or not Path(root).is_dir():
+            sys.exit(f'HATA: analiz klasörü yok: {root!r}. --root ile ver.')
+        out, n = build_static(root)
+        print(f'Tamam: {n} analiz -> {out}')
+        if not a.no_open:
+            webbrowser.open(out.resolve().as_uri())
     else:
-        if not a.analysis:
-            sys.exit('Analiz klasör adını ver: python postproc.py ' + a.cmd + ' analiz-1')
-        (cmd_inspect if a.cmd == 'inspect' else cmd_diag)(cfg, a.analysis)
+        cmd_diag(root, a.analysis)
 
 
 if __name__ == '__main__':
