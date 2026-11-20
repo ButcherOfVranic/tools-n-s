@@ -3,3 +3,6 @@ postproc_eslesme_varsayilan.json
 .postproc_cache/
 _paylasim/
 __pycache__/
+build/
+dist/
+*.spec

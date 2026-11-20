@@ -25,6 +25,25 @@ py postproc.py                          # sonraki seferler
 Tarayıcıda arayüz açılır (`http://127.0.0.1:8765`, yalnızca bu bilgisayardan erişilir).
 `D:\analizler` altındaki her alt klasör bir analizdir. Yeni analiz için klasörü oraya kopyala, **↻ Yeniden tara**.
 
+## Dağıtım (.exe — kaynak kod olmadan paylaşma)
+
+Başkalarına Python/kaynak kod vermeden tek bir uygulama olarak dağıtmak için `.exe` üretilir.
+Derleme için **sadece senin makinende** bir kez `pyinstaller` gerekir; alıcıya hiçbir şey kurulmaz.
+
+```
+py -m pip install pyinstaller     # bir kez
+build.bat                         # çift tıkla (ya da komut satırından çalıştır)
+```
+
+Sonuç: **`dist\PostProcess\`** klasörü. İçindeki `PostProcess.exe` çift tıklanınca arayüz açılır.
+Tüm klasörü (zip'le ~9 MB) karşı tarafa gönder; `.py` / `ui\*.js` kaynakları `_internal\` içine gömülüdür,
+dışarıdan görünmez ve düzenlenemez. Python kurulu olması gerekmez.
+
+- **onedir** seçildi: anında açılır (açılışta bekleme yok), antivirüs daha az takılır.
+- Ayarlar (`postproc_local.json`, seçilen analiz klasörü) exe'nin yanına yazılır; her kopya kendi ayarını hatırlar.
+- Not: `.exe` mutlak koruma değildir (teorik olarak decompile edilebilir), ama kaynağı açıp değiştirmeyi pratikte engeller.
+  Tarayıcıda çalışan arayüz JS'i view-source ile görülebilir — bu tüm web araçları için geçerlidir.
+
 ## Özellikler
 
 - **Dosya adı/yeri önemli değil**: tüm metin dosyaları içeriğine göre tanınır (yüzey raporları, XY / circ-avg,

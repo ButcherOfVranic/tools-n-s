@@ -20,12 +20,19 @@ from urllib.parse import unquote, urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = Path(__file__).resolve().parent
+# Exe (PyInstaller) olarak paketlendiğinde iki yol birbirinden ayrılır:
+#   ASSET_DIR -> şablon + ui/ gibi SALT-OKUNUR paketlenmiş dosyalar (exe içinde _internal klasörü)
+#   DATA_DIR  -> ayar dosyaları; YAZILABİLİR ve kalıcı olmalı (exe'nin yanındaki klasör)
+# Kaynak koddan çalışırken ikisi de postproc.py'nin yanıdır (davranış değişmez).
+FROZEN = getattr(sys, 'frozen', False)
+ASSET_DIR = Path(getattr(sys, '_MEIPASS', HERE))
+DATA_DIR = Path(sys.executable).resolve().parent if FROZEN else HERE
 VERSION = '3.1'
 AUTHOR = 'Muhammed Emin URAL'
 SCAN_VER = 3                       # ayrıştırıcı değişirse önbelleği geçersiz kılmak için artır
-LOCAL = HERE / 'postproc_local.json'   # makineye özel (root, port); repoda yok
+LOCAL = DATA_DIR / 'postproc_local.json'   # makineye özel (root, port); repoda yok
 MAP_NAME = 'postproc_eslesme.json'
-DEFAULT_MAP = HERE / 'postproc_eslesme_varsayilan.json'   # son kaydedilen eşleme: yeni klasörlerde başlangıç
+DEFAULT_MAP = DATA_DIR / 'postproc_eslesme_varsayilan.json'   # son kaydedilen eşleme: yeni klasörlerde başlangıç
 CACHE_DIR = '.postproc_cache'
 SHARE_DIR = '_paylasim'              # paylaşım HTML'leri ("_" ile başladığı için analiz sayılmaz)
 UI_FILES = ['core.js', 'charts.js', 'views.js', 'gallery.js', 'mapping.js', 'notes.js', 'export.js', 'main.js']
@@ -389,12 +396,12 @@ def collect(root, mode, log=print):
 
 
 def render_html(data):
-    tpl = HERE / 'dashboard_template.html'
-    missing = [f for f in UI_FILES if not (HERE / 'ui' / f).is_file()]
+    tpl = ASSET_DIR / 'dashboard_template.html'
+    missing = [f for f in UI_FILES if not (ASSET_DIR / 'ui' / f).is_file()]
     if not tpl.is_file() or missing:
         sys.exit('HATA: dashboard_template.html ve ui/ klasörü postproc.py ile aynı yerde olmalı. Eksik: '
                  + ', '.join(missing or ['dashboard_template.html']))
-    js = '\n'.join(decode((HERE / 'ui' / f).read_bytes()) for f in UI_FILES).replace('</script', '<\\/script')
+    js = '\n'.join(decode((ASSET_DIR / 'ui' / f).read_bytes()) for f in UI_FILES).replace('</script', '<\\/script')
     data_js = json.dumps(data, ensure_ascii=False, allow_nan=False).replace('</', '<\\/')
     html = decode(tpl.read_bytes()).replace('__SCRIPTS__', js, 1)
     return html.replace('__DATA__', data_js, 1)
@@ -626,7 +633,7 @@ def main():
     ap.add_argument('--no-open', action='store_true', help='tarayıcıyı otomatik açma')
     a = ap.parse_args()
     local = read_json(LOCAL, {}) or {}
-    root = a.root or local.get('root') or (read_json(HERE / 'config.json', {}) or {}).get('root', '')
+    root = a.root or local.get('root') or (read_json(DATA_DIR / 'config.json', {}) or {}).get('root', '')
     if a.root:
         save_local(root=str(Path(a.root)))
     if a.cmd == 'serve':
