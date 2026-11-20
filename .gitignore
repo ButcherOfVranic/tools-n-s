@@ -1,0 +1,5 @@
+postproc_local.json
+postproc_eslesme_varsayilan.json
+.postproc_cache/
+_paylasim/
+__pycache__/

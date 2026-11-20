@@ -20,13 +20,16 @@ from urllib.parse import unquote, urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = Path(__file__).resolve().parent
-VERSION = '3.0'
+VERSION = '3.1'
 AUTHOR = 'Muhammed Emin URAL'
 SCAN_VER = 3                       # ayrıştırıcı değişirse önbelleği geçersiz kılmak için artır
 LOCAL = HERE / 'postproc_local.json'   # makineye özel (root, port); repoda yok
 MAP_NAME = 'postproc_eslesme.json'
 DEFAULT_MAP = HERE / 'postproc_eslesme_varsayilan.json'   # son kaydedilen eşleme: yeni klasörlerde başlangıç
 CACHE_DIR = '.postproc_cache'
+SHARE_DIR = '_paylasim'              # paylaşım HTML'leri ("_" ile başladığı için analiz sayılmaz)
+UI_FILES = ['core.js', 'charts.js', 'views.js', 'gallery.js', 'mapping.js', 'notes.js', 'export.js', 'main.js']
+BACKUP_KEEP = 30                   # eşleme dosyasının saklanan eski kopyası (ek özellik; 0 = kapalı)
 MAX_TEXT = 30 * 1024 * 1024        # bundan büyük metin dosyaları atlanır
 MAX_PTS = 600                      # gömülen seri başına nokta
 IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.bmp', '.webp'}
@@ -387,10 +390,14 @@ def collect(root, mode, log=print):
 
 def render_html(data):
     tpl = HERE / 'dashboard_template.html'
-    if not tpl.is_file():
-        sys.exit(f'HATA: {tpl.name} bulunamadı. postproc.py ile aynı klasöre koy.')
-    js = json.dumps(data, ensure_ascii=False, allow_nan=False).replace('</', '<\\/')
-    return decode(tpl.read_bytes()).replace('__DATA__', js)
+    missing = [f for f in UI_FILES if not (HERE / 'ui' / f).is_file()]
+    if not tpl.is_file() or missing:
+        sys.exit('HATA: dashboard_template.html ve ui/ klasörü postproc.py ile aynı yerde olmalı. Eksik: '
+                 + ', '.join(missing or ['dashboard_template.html']))
+    js = '\n'.join(decode((HERE / 'ui' / f).read_bytes()) for f in UI_FILES).replace('</script', '<\\/script')
+    data_js = json.dumps(data, ensure_ascii=False, allow_nan=False).replace('</', '<\\/')
+    html = decode(tpl.read_bytes()).replace('__SCRIPTS__', js, 1)
+    return html.replace('__DATA__', data_js, 1)
 
 
 def build_static(root, log=print):
@@ -405,6 +412,44 @@ def build_static(root, log=print):
 # ----------------------------------------------------------------------------
 # Yerel sunucu
 # ----------------------------------------------------------------------------
+def backup_mapping(root):
+    """Eşleme dosyasının eski hâlini en fazla 10 dakikada bir .postproc_cache/yedek altına kopyalar."""
+    src = root / MAP_NAME
+    if BACKUP_KEEP <= 0 or not src.is_file():
+        return
+    bdir = root / CACHE_DIR / 'yedek'
+    try:
+        bdir.mkdir(parents=True, exist_ok=True)
+        olds = sorted(bdir.glob('postproc_eslesme_*.json'))
+        if olds and time.time() - olds[-1].stat().st_mtime < 600:
+            return
+        (bdir / time.strftime('postproc_eslesme_%Y%m%d_%H%M%S.json')).write_bytes(src.read_bytes())
+        for o in olds[:max(0, len(olds) + 1 - BACKUP_KEEP)]:
+            o.unlink()
+    except OSError:
+        pass
+
+
+def build_share(root, body):
+    """Seçili analizler + tarayıcının gönderdiği (yeniden sıkıştırılmış) görseller -> tek dosyalık HTML."""
+    data = collect(root, 'static', log=lambda *a: None)
+    keep = set(body.get('sel') or [])
+    if keep:
+        data['analyses'] = [a for a in data['analyses'] if a['name'] in keep]
+    for a in data['analyses']:
+        a['parsed'] = a['parsed'][:200]
+    data['mapping'] = body.get('mapping') or data['mapping']
+    data['default_mapping'] = None
+    data['embed'] = body.get('embed') or {}
+    data['root'] = Path(root).name           # alıcıya şirket içi tam yol gitmesin
+    name = re.sub(r'[^\w\-. ]+', '_', str(body.get('name') or '').strip())[:60] or 'paylasim'
+    out_dir = Path(root) / SHARE_DIR
+    out_dir.mkdir(exist_ok=True)
+    out = out_dir / f"{time.strftime('%Y%m%d_%H%M')}_{name}.html"
+    out.write_text(render_html(data), encoding='utf-8')
+    return out, out.stat().st_size
+
+
 class State:
     root = ''
     lock = threading.Lock()
@@ -467,6 +512,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/mapping':
                 if not Path(State.root).is_dir():
                     return self.jsend({'ok': False, 'err': 'root yok'}, 400)
+                backup_mapping(Path(State.root))
                 write_json(Path(State.root) / MAP_NAME, body)
                 try:
                     write_json(DEFAULT_MAP, body)
@@ -484,6 +530,10 @@ class Handler(BaseHTTPRequestHandler):
                 with State.lock:
                     out, n = build_static(State.root, log=lambda *a: None)
                 return self.jsend({'ok': True, 'path': str(out), 'n': n})
+            if path == '/api/share':
+                with State.lock:
+                    out, size = build_share(State.root, body)
+                return self.jsend({'ok': True, 'path': str(out), 'size': size})
             if path == '/api/open':  # klasörü Windows Gezgini'nde aç
                 p = (Path(State.root) / body.get('rel', '')).resolve()
                 if Path(State.root).resolve() in [p, *p.parents] and p.exists() and hasattr(os, 'startfile'):
