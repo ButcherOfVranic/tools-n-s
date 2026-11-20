@@ -1,0 +1,73 @@
+{
+  "root": "D:/analizler",
+  "analysis_glob": "analiz-*",
+  "exclude": [],
+  "reference": "analiz-1",
+  "out_dir": "",
+
+  "files": {
+    "report": [
+      "summary/**/report*.txt",
+      "summary/**/report*.rxt",
+      "**/report*.txt",
+      "**/report*.rxt"
+    ]
+  },
+
+  "surfaces": {
+    "inlet": "inlet",
+    "diffuser_exit": "diffuser-outlet",
+    "outlet": "outlet"
+  },
+
+  "vars": {
+    "pt": "total pressure",
+    "tt": "total temperature",
+    "ps": "static pressure",
+    "mfr": "mass flow rate"
+  },
+  "kinds": { "pt": "mwa", "tt": "mwa", "ps": "awa" },
+  "otdf_tmax_var": "total temperature",
+
+  "rtdf_profile": "outlet_circ_T",
+
+  "profiles": {
+    "inlet_circ_Pt": {
+      "label": "Giriş - circ avg Pt",
+      "patterns": ["summary/**/*inlet*circ*pres*.txt", "summary/**/*inlet*circ*.txt"],
+      "series": 0, "xlabel": "Span", "ylabel": "Pt [Pa]", "span_vertical": true
+    },
+    "diffuser_circ_Pt": {
+      "label": "Difüzör çıkışı - circ avg Pt",
+      "patterns": ["summary/**/*diff*circ*pres*.txt", "summary/**/*diff*circ*.txt"],
+      "series": 0, "xlabel": "Span", "ylabel": "Pt [Pa]", "span_vertical": true
+    },
+    "outlet_circ_Pt": {
+      "label": "Çıkış - circ avg Pt",
+      "patterns": ["summary/**/*outlet*circ*pres*.txt"],
+      "series": 0, "xlabel": "Span", "ylabel": "Pt [Pa]", "span_vertical": true
+    },
+    "outlet_circ_T": {
+      "label": "Çıkış - circ avg Tt",
+      "patterns": ["summary/**/*outlet*circ*temp*.txt", "summary/**/*outlet*circ*.txt"],
+      "series": 0, "xlabel": "Span", "ylabel": "Tt [K]", "span_vertical": true
+    },
+    "outlet_rad_T": {
+      "label": "Çıkış - radyal avg Tt",
+      "patterns": ["summary/**/*outlet*rad*temp*.txt", "summary/**/*outlet*rad*.txt"],
+      "series": 0, "xlabel": "Açı/Konum", "ylabel": "Tt [K]", "span_vertical": false
+    }
+  },
+
+  "flow_split": [
+    { "label": "Swirler",        "surface": "swirler",     "x": 0.12, "y": 0.50 },
+    { "label": "Liner dış ann.", "surface": "outer-ann",   "x": 0.45, "y": 0.12 },
+    { "label": "Liner iç ann.",  "surface": "inner-ann",   "x": 0.45, "y": 0.88 },
+    { "label": "Dilution",       "surface": "dilution",    "x": 0.70, "y": 0.30 },
+    { "label": "Soğutma",        "surface": "cooling",     "x": 0.70, "y": 0.70 }
+  ],
+
+  "section_image": "combustor_section.png",
+
+  "images": ["summary/**/*.png", "summary/**/*.jpg"]
+}
